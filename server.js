@@ -114,13 +114,19 @@ app.post('/api/whapi/webhook', async (req, res) => {
 // ==================== Buscador de carreras (público, lectura) ====================
 // Reemplaza el dataset de ~2,5 MB incrustado en la página del buscador: el sitio
 // consulta esta API y recibe solo los resultados filtrados.
+// Datos públicos de referencia: se sirven con CORS abierto (solo lectura, sin credenciales).
+const publicRead = (res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Cache-Control', 'public, max-age=300');
+};
+
 app.get('/api/carreras', async (req, res) => {
+  publicRead(res);
   try {
     const rows = await careers.search({
-      q: req.query.q, tipo: req.query.tipo, region: req.query.region,
-      area: req.query.area, limit: req.query.limit,
+      q: req.query.q, career: req.query.career, tipo: req.query.tipo,
+      region: req.query.region, area: req.query.area, limit: req.query.limit,
     });
-    res.set('Cache-Control', 'public, max-age=300');
     res.json({ ok: true, count: rows.length, rows });
   } catch (err) {
     console.error('[carreras]', err.message);
@@ -128,7 +134,19 @@ app.get('/api/carreras', async (req, res) => {
   }
 });
 
+app.get('/api/carreras/suggest', async (req, res) => {
+  publicRead(res);
+  try {
+    const items = await careers.suggest({ q: req.query.q, tipo: req.query.tipo, region: req.query.region });
+    res.json({ ok: true, items });
+  } catch (err) {
+    console.error('[carreras/suggest]', err.message);
+    res.status(500).json({ ok: false, error: 'Error interno.' });
+  }
+});
+
 app.get('/api/carreras/stats', async (req, res) => {
+  publicRead(res);
   try { res.json({ ok: true, stats: await careers.getStats() }); }
   catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
