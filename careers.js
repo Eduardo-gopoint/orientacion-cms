@@ -1,0 +1,199 @@
+'use strict';
+// Módulo de carreras/instituciones para el buscador de orientacionvocacional.cl
+// Migra el dataset (Mi Futuro) que hoy vive incrustado (~2,5 MB) en la página del
+// buscador hacia Supabase, y expone búsqueda server-side para aligerar la página.
+const { pool } = require('./db');
+
+// Fuente del dataset actual (se lee del sitio en vivo para no versionar 2,5 MB en el repo).
+const DATASET_URL = process.env.CAREERS_DATASET_URL
+  || 'https://orientacion-mirror.onrender.com/buscador-carreras-instituciones/';
+
+// ---------- utilidades ----------
+function norm(s) {
+  return String(s || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // quita acentos
+    .toLowerCase().trim().replace(/\s+/g, ' ');
+}
+function arancelToInt(s) {
+  const digits = String(s || '').replace(/[^0-9]/g, '');
+  return digits ? parseInt(digits, 10) : null;
+}
+
+// ---------- esquema (idempotente) ----------
+async function initSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS instituciones (
+      id                BIGSERIAL PRIMARY KEY,
+      nombre            TEXT NOT NULL UNIQUE,
+      tipo              TEXT NOT NULL,
+      sigla             TEXT,
+      sitio_web         TEXT,
+      acreditacion      TEXT,
+      anos_acreditacion INT,
+      logo_url          TEXT,
+      created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS programas (
+      id             BIGSERIAL PRIMARY KEY,
+      ficha          TEXT NOT NULL UNIQUE,
+      institucion_id BIGINT REFERENCES instituciones(id),
+      institucion    TEXT NOT NULL,
+      tipo           TEXT NOT NULL,
+      area           TEXT,
+      carrera        TEXT NOT NULL,
+      sede           TEXT,
+      region         TEXT,
+      jornada        TEXT,
+      duracion       TEXT,
+      arancel_texto  TEXT,
+      arancel_valor  INT,
+      search_text    TEXT,
+      empleabilidad     NUMERIC,
+      ingreso_promedio  INT,
+      puntaje_corte     INT,
+      link_oficial      TEXT,
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS programas_institucion_idx ON programas (institucion_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS programas_region_idx ON programas (region);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS programas_tipo_idx ON programas (tipo);`);
+  // pg_trgm acelera los ILIKE de búsqueda; si no se puede crear, ILIKE igual funciona.
+  try {
+    await pool.query(`CREATE EXTENSION IF NOT EXISTS pg_trgm;`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS programas_search_trgm ON programas USING gin (search_text gin_trgm_ops);`);
+  } catch (e) { console.warn('[careers] pg_trgm no disponible (búsqueda funciona igual):', e.message); }
+  console.log('[careers] esquema instituciones/programas verificado');
+}
+
+// ---------- descarga + parseo del dataset incrustado ----------
+async function fetchDataset() {
+  const resp = await fetch(DATASET_URL, { headers: { 'User-Agent': 'orientacion-cms-migrator' } });
+  if (!resp.ok) throw new Error('fetch dataset HTTP ' + resp.status);
+  const html = await resp.text();
+  const marker = 'window.ORV_CAREER_ROWS=';
+  const i = html.indexOf(marker);
+  if (i < 0) throw new Error('no se encontró ORV_CAREER_ROWS en el HTML');
+  const start = html.indexOf('[', i);
+  let depth = 0, end = -1;
+  for (let k = start; k < html.length; k++) {
+    const ch = html[k];
+    if (ch === '[') depth++;
+    else if (ch === ']') { depth--; if (depth === 0) { end = k + 1; break; } }
+  }
+  if (end < 0) throw new Error('no se pudo delimitar el array ORV_CAREER_ROWS');
+  const rows = JSON.parse(html.slice(start, end));
+  if (!Array.isArray(rows) || !rows.length) throw new Error('dataset vacío');
+  return rows;
+}
+
+// ---------- migración (idempotente vía ON CONFLICT) ----------
+async function migrate() {
+  const rows = await fetchDataset();
+
+  // 1) instituciones únicas → mapa nombre→id
+  const instByName = new Map();
+  for (const r of rows) {
+    const nombre = (r.institucion || '').trim();
+    if (nombre && !instByName.has(nombre)) instByName.set(nombre, (r.tipo || '').trim());
+  }
+  const idByName = new Map();
+  for (const [nombre, tipo] of instByName) {
+    const { rows: out } = await pool.query(
+      `INSERT INTO instituciones (nombre, tipo) VALUES ($1,$2)
+       ON CONFLICT (nombre) DO UPDATE SET tipo = EXCLUDED.tipo
+       RETURNING id`, [nombre, tipo || null]);
+    idByName.set(nombre, out[0].id);
+  }
+
+  // 2) programas por lotes (upsert por ficha) — 13 columnas por fila
+  const COLS = 13;
+  const BATCH = 400;
+  const rowToParams = (r) => {
+    const inst = (r.institucion || '').trim();
+    return [
+      (r.ficha || '').trim(),                 // ficha
+      idByName.get(inst) || null,             // institucion_id
+      inst,                                   // institucion
+      (r.tipo || '').trim(),                  // tipo
+      (r.area || '').trim() || null,          // area
+      (r.carrera || '').trim(),               // carrera
+      (r.sede || '').trim() || null,          // sede
+      (r.region || '').trim() || null,        // region
+      (r.jornada || '').trim() || null,       // jornada
+      (r.duracion || '').trim() || null,      // duracion
+      (r.arancel || '').trim() || null,       // arancel_texto
+      arancelToInt(r.arancel),                // arancel_valor
+      norm(`${r.carrera || ''} ${r.institucion || ''}`), // search_text
+    ];
+  };
+  for (let b = 0; b < rows.length; b += BATCH) {
+    const chunk = rows.slice(b, b + BATCH);
+    const placeholders = chunk.map((_, idx) => {
+      const base = idx * COLS;
+      return '(' + Array.from({ length: COLS }, (_, k) => `$${base + k + 1}`).join(',') + ')';
+    }).join(',');
+    const params = chunk.flatMap(rowToParams);
+    await pool.query(
+      `INSERT INTO programas
+         (ficha, institucion_id, institucion, tipo, area, carrera, sede, region, jornada, duracion, arancel_texto, arancel_valor, search_text)
+       VALUES ${placeholders}
+       ON CONFLICT (ficha) DO UPDATE SET
+         institucion_id = EXCLUDED.institucion_id, institucion = EXCLUDED.institucion,
+         tipo = EXCLUDED.tipo, area = EXCLUDED.area, carrera = EXCLUDED.carrera,
+         sede = EXCLUDED.sede, region = EXCLUDED.region, jornada = EXCLUDED.jornada,
+         duracion = EXCLUDED.duracion, arancel_texto = EXCLUDED.arancel_texto,
+         arancel_valor = EXCLUDED.arancel_valor, search_text = EXCLUDED.search_text`,
+      params
+    );
+  }
+  const stats = await getStats();
+  console.log('[careers] migración OK:', JSON.stringify(stats));
+  return { ...stats, source_rows: rows.length };
+}
+
+// Carga automática en arranque si la tabla está vacía (no bloquea el boot).
+async function ensureLoaded() {
+  try {
+    const { rows } = await pool.query(`SELECT count(*)::int AS n FROM programas`);
+    if (rows[0].n > 0) { console.log('[careers] ya cargado:', rows[0].n, 'programas'); return; }
+    console.log('[careers] tabla vacía → cargando dataset en segundo plano…');
+    const out = await migrate();
+    console.log('[careers] carga inicial completa:', JSON.stringify(out));
+  } catch (e) { console.error('[careers] ensureLoaded falló:', e.message); }
+}
+
+// ---------- consultas ----------
+async function getStats() {
+  const { rows } = await pool.query(`
+    SELECT (SELECT count(*)::int FROM programas)                 AS programas,
+           (SELECT count(*)::int FROM instituciones)            AS instituciones,
+           (SELECT count(DISTINCT carrera)::int FROM programas) AS carreras,
+           (SELECT count(DISTINCT region)::int FROM programas)  AS regiones`);
+  return rows[0];
+}
+
+async function search({ q, tipo, region, area, limit } = {}) {
+  const params = [];
+  const where = [];
+  const qn = norm(q);
+  if (qn) { params.push('%' + qn + '%'); where.push(`search_text ILIKE $${params.length}`); }
+  if (tipo) { params.push(tipo); where.push(`tipo = $${params.length}`); }
+  if (region) { params.push(region); where.push(`region = $${params.length}`); }
+  if (area) { params.push(area); where.push(`area = $${params.length}`); }
+  const lim = Math.min(Number(limit) || 800, 2000);
+  params.push(lim);
+  const sql = `
+    SELECT area, carrera, institucion, tipo, sede, region, jornada,
+           arancel_texto AS arancel, duracion, ficha
+    FROM programas
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+    ORDER BY institucion, carrera
+    LIMIT $${params.length}`;
+  const { rows } = await pool.query(sql, params);
+  return rows;
+}
+
+module.exports = { initSchema, migrate, ensureLoaded, getStats, search, DATASET_URL };
