@@ -151,6 +151,22 @@ app.get('/api/carreras/stats', async (req, res) => {
   catch (err) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
+// Contenido editorial dinámico por carrera ("Beneficios de estudiar…").
+app.get('/api/carreras/info', async (req, res) => {
+  publicRead(res);
+  try { res.json({ ok: true, info: await careers.getInfo(req.query.career) }); }
+  catch (err) { console.error('[carreras/info]', err.message); res.status(500).json({ ok: false, error: 'Error interno.' }); }
+});
+
+// Escritura del contenido editorial (protegida por token, para redactar/actualizar).
+app.post('/api/admin/carreras-info', async (req, res) => {
+  const token = req.get('x-migrate-token') || (req.query && req.query.token) || '';
+  const expected = process.env.MIGRATE_TOKEN || '';
+  if (!expected || token !== expected) return res.status(401).json({ ok: false, error: 'Token inválido.' });
+  try { res.json({ ok: true, ...(await careers.upsertInfo(req.body || {})) }); }
+  catch (err) { res.status(500).json({ ok: false, error: err.message }); }
+});
+
 // Migración/recarga del dataset → Supabase. Protegida por token (header x-migrate-token
 // o ?token=), independiente del login admin para poder ejecutarla en despliegue.
 app.post('/api/admin/migrate-careers', async (req, res) => {
