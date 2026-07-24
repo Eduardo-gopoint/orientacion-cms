@@ -69,7 +69,18 @@ async function initSchema() {
     await pool.query(`CREATE INDEX IF NOT EXISTS programas_search_trgm ON programas USING gin (search_text gin_trgm_ops);`);
     await pool.query(`CREATE INDEX IF NOT EXISTS programas_carrera_norm_trgm ON programas USING gin (carrera_norm gin_trgm_ops);`);
   } catch (e) { console.warn('[careers] pg_trgm no disponible (búsqueda funciona igual):', e.message); }
-  console.log('[careers] esquema instituciones/programas verificado');
+  // Contenido editorial por carrera (descripción/beneficios) para el aside dinámico.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS carreras_info (
+      carrera_norm      TEXT PRIMARY KEY,
+      carrera           TEXT,
+      descripcion       TEXT,
+      duracion_promedio TEXT,
+      area_desempeno    TEXT,
+      updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  console.log('[careers] esquema instituciones/programas/carreras_info verificado');
 }
 
 // ---------- descarga + parseo del dataset incrustado ----------
@@ -236,4 +247,29 @@ async function suggest({ q, tipo, region } = {}) {
   }));
 }
 
-module.exports = { initSchema, migrate, ensureLoaded, getStats, search, suggest, DATASET_URL };
+// Contenido editorial dinámico por carrera (bloque "Beneficios de estudiar…").
+async function getInfo(career) {
+  const cn = norm(career);
+  if (!cn) return null;
+  const { rows } = await pool.query(
+    `SELECT carrera, descripcion, duracion_promedio, area_desempeno
+     FROM carreras_info WHERE carrera_norm = $1`, [cn]);
+  return rows[0] || null;
+}
+
+async function upsertInfo({ career, descripcion, duracion_promedio, area_desempeno } = {}) {
+  const cn = norm(career);
+  if (!cn) throw new Error('career requerido');
+  const { rows } = await pool.query(
+    `INSERT INTO carreras_info (carrera_norm, carrera, descripcion, duracion_promedio, area_desempeno, updated_at)
+     VALUES ($1,$2,$3,$4,$5,now())
+     ON CONFLICT (carrera_norm) DO UPDATE SET
+       carrera = EXCLUDED.carrera, descripcion = EXCLUDED.descripcion,
+       duracion_promedio = EXCLUDED.duracion_promedio, area_desempeno = EXCLUDED.area_desempeno,
+       updated_at = now()
+     RETURNING carrera_norm`,
+    [cn, career, descripcion || null, duracion_promedio || null, area_desempeno || null]);
+  return rows[0];
+}
+
+module.exports = { initSchema, migrate, ensureLoaded, getStats, search, suggest, getInfo, upsertInfo, DATASET_URL };
