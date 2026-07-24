@@ -10,6 +10,7 @@ const auth = require('./auth');
 const { sendLeadEmail } = require('./mailer');
 const calendar = require('./calendar');
 const whapi = require('./whapi');
+const careers = require('./careers');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -110,6 +111,43 @@ app.post('/api/whapi/webhook', async (req, res) => {
   }
 });
 
+// ==================== Buscador de carreras (público, lectura) ====================
+// Reemplaza el dataset de ~2,5 MB incrustado en la página del buscador: el sitio
+// consulta esta API y recibe solo los resultados filtrados.
+app.get('/api/carreras', async (req, res) => {
+  try {
+    const rows = await careers.search({
+      q: req.query.q, tipo: req.query.tipo, region: req.query.region,
+      area: req.query.area, limit: req.query.limit,
+    });
+    res.set('Cache-Control', 'public, max-age=300');
+    res.json({ ok: true, count: rows.length, rows });
+  } catch (err) {
+    console.error('[carreras]', err.message);
+    res.status(500).json({ ok: false, error: 'Error interno.' });
+  }
+});
+
+app.get('/api/carreras/stats', async (req, res) => {
+  try { res.json({ ok: true, stats: await careers.getStats() }); }
+  catch (err) { res.status(500).json({ ok: false, error: err.message }); }
+});
+
+// Migración/recarga del dataset → Supabase. Protegida por token (header x-migrate-token
+// o ?token=), independiente del login admin para poder ejecutarla en despliegue.
+app.post('/api/admin/migrate-careers', async (req, res) => {
+  const token = req.get('x-migrate-token') || (req.query && req.query.token) || '';
+  const expected = process.env.MIGRATE_TOKEN || '';
+  if (!expected || token !== expected) return res.status(401).json({ ok: false, error: 'Token inválido.' });
+  try {
+    const out = await careers.migrate();
+    res.json({ ok: true, ...out });
+  } catch (err) {
+    console.error('[migrate-careers]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // ==================== Auth ====================
 app.post('/api/login', async (req, res) => {
   try {
@@ -190,11 +228,16 @@ app.use(express.static(path.join(__dirname, 'public')));
 async function start() {
   try {
     await db.init();
+    await careers.initSchema();
     await auth.seedAdmin();
   } catch (e) {
     console.error('[start] init/seed falló (el servicio sigue arriba):', e.message);
   }
-  app.listen(PORT, () => console.log(`[orientacion-cms] escuchando en :${PORT}`));
+  app.listen(PORT, () => {
+    console.log(`[orientacion-cms] escuchando en :${PORT}`);
+    // Carga inicial del dataset del buscador si la tabla está vacía (no bloquea el arranque).
+    careers.ensureLoaded();
+  });
 }
 
 start();
