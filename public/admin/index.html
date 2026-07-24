@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Panel de Leads · Orientación Vocacional</title>
+  <style>
+    :root { color-scheme: light dark; --bg:#0f1115; --panel:#171a21; --line:#262b36; --txt:#e7e9ee; --mut:#9aa0ab; --red:#ff0300; }
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: var(--bg); color: var(--txt); }
+    header { padding: 18px 24px; border-bottom: 1px solid var(--line); display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }
+    header h1 { font-size: 1.15rem; margin: 0; }
+    .meta { color: var(--mut); font-size: .85rem; }
+    .wrap { padding: 24px; }
+    .bar { display:flex; gap:12px; align-items:center; margin-bottom:16px; flex-wrap:wrap; }
+    input[type=search] { background: var(--panel); border:1px solid var(--line); color: var(--txt); padding:9px 12px; border-radius:8px; min-width:220px; }
+    button { background: var(--panel); border:1px solid var(--line); color: var(--txt); padding:9px 14px; border-radius:8px; cursor:pointer; }
+    button:hover { border-color:#3a414f; }
+    .count { color: var(--mut); font-size:.9rem; }
+    table { width:100%; border-collapse: collapse; font-size:.9rem; }
+    th, td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:top; }
+    th { color: var(--mut); font-weight:600; position:sticky; top:0; background:var(--bg); }
+    tr:hover td { background: #12151b; }
+    .email a { color:#7db6ff; text-decoration:none; }
+    .msg { max-width:380px; white-space:pre-wrap; color:#cfd3db; }
+    .pill { font-size:.72rem; padding:2px 8px; border-radius:20px; border:1px solid var(--line); color:var(--mut); }
+    .pill.ok { color:#25c26e; border-color:#1e5c3a; }
+    .empty, .err { padding:40px; text-align:center; color:var(--mut); }
+    .err { color:#ff8f8d; }
+    .src { color:var(--mut); font-size:.78rem; word-break:break-all; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>📋 Leads · Orientación Vocacional</h1>
+    <span class="meta" id="meta">Cargando…</span>
+  </header>
+  <div class="wrap">
+    <div class="bar">
+      <input type="search" id="q" placeholder="Buscar por nombre, email o mensaje…">
+      <button id="refresh">↻ Actualizar</button>
+      <button id="csv">⬇ Exportar CSV</button>
+      <span class="count" id="count"></span>
+    </div>
+    <div id="content"><div class="empty">Cargando…</div></div>
+  </div>
+
+  <script>
+    let ALL = [];
+    const $ = (s) => document.querySelector(s);
+
+    function fmtDate(s) {
+      try { return new Date(s).toLocaleString('es-CL', { timeZone:'America/Santiago', dateStyle:'short', timeStyle:'short' }); }
+      catch { return s; }
+    }
+    function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+    function render(rows) {
+      const c = $('#content');
+      if (!rows.length) { c.innerHTML = '<div class="empty">Sin leads todavía.</div>'; $('#count').textContent=''; return; }
+      let h = '<table><thead><tr><th>Fecha</th><th>Nombre</th><th>Email</th><th>Teléfono</th><th>Mensaje</th><th>Origen</th><th>Correo</th></tr></thead><tbody>';
+      for (const r of rows) {
+        h += `<tr>
+          <td>${fmtDate(r.created_at)}</td>
+          <td>${esc(r.name)}</td>
+          <td class="email"><a href="mailto:${esc(r.email)}">${esc(r.email)}</a></td>
+          <td>${esc(r.phone)||'—'}</td>
+          <td class="msg">${esc(r.message)||'—'}</td>
+          <td class="src">${esc(r.source_page)||'—'}</td>
+          <td>${r.emailed?'<span class="pill ok">enviado</span>':'<span class="pill">no</span>'}</td>
+        </tr>`;
+      }
+      h += '</tbody></table>';
+      c.innerHTML = h;
+      $('#count').textContent = rows.length + ' de ' + ALL.length;
+    }
+
+    function applyFilter() {
+      const q = $('#q').value.toLowerCase().trim();
+      if (!q) return render(ALL);
+      render(ALL.filter(r => [r.name,r.email,r.phone,r.message,r.source_page].join(' ').toLowerCase().includes(q)));
+    }
+
+    async function load() {
+      $('#content').innerHTML = '<div class="empty">Cargando…</div>';
+      try {
+        const resp = await fetch('/api/leads?limit=1000', { credentials:'same-origin' });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data = await resp.json();
+        ALL = data.leads || [];
+        $('#meta').textContent = ALL.length + ' leads · ' + new Date().toLocaleTimeString('es-CL');
+        applyFilter();
+      } catch (e) {
+        $('#content').innerHTML = '<div class="err">No se pudieron cargar los leads: ' + esc(e.message) + '</div>';
+      }
+    }
+
+    function toCSV() {
+      const head = ['fecha','nombre','email','telefono','mensaje','origen','correo_enviado'];
+      const lines = [head.join(',')];
+      for (const r of ALL) {
+        const cells = [fmtDate(r.created_at), r.name, r.email, r.phone||'', (r.message||'').replace(/\n/g,' '), r.source_page||'', r.emailed?'si':'no'];
+        lines.push(cells.map(v => '"' + String(v==null?'':v).replace(/"/g,'""') + '"').join(','));
+      }
+      const blob = new Blob([lines.join('\n')], { type:'text/csv;charset=utf-8' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'leads-orientacion-' + new Date().toISOString().slice(0,10) + '.csv';
+      a.click();
+    }
+
+    $('#q').addEventListener('input', applyFilter);
+    $('#refresh').addEventListener('click', load);
+    $('#csv').addEventListener('click', toCSV);
+    load();
+  </script>
+</body>
+</html>
