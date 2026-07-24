@@ -50,6 +50,7 @@ async function initSchema() {
       arancel_texto  TEXT,
       arancel_valor  INT,
       search_text    TEXT,
+      carrera_norm   TEXT,
       empleabilidad     NUMERIC,
       ingreso_promedio  INT,
       puntaje_corte     INT,
@@ -57,6 +58,8 @@ async function initSchema() {
       created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+  // Migración suave: columnas que pueden faltar si la tabla ya existía.
+  try { await pool.query(`ALTER TABLE programas ADD COLUMN IF NOT EXISTS carrera_norm TEXT;`); } catch (e) { /* noop */ }
   await pool.query(`CREATE INDEX IF NOT EXISTS programas_institucion_idx ON programas (institucion_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS programas_region_idx ON programas (region);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS programas_tipo_idx ON programas (tipo);`);
@@ -64,6 +67,7 @@ async function initSchema() {
   try {
     await pool.query(`CREATE EXTENSION IF NOT EXISTS pg_trgm;`);
     await pool.query(`CREATE INDEX IF NOT EXISTS programas_search_trgm ON programas USING gin (search_text gin_trgm_ops);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS programas_carrera_norm_trgm ON programas USING gin (carrera_norm gin_trgm_ops);`);
   } catch (e) { console.warn('[careers] pg_trgm no disponible (búsqueda funciona igual):', e.message); }
   console.log('[careers] esquema instituciones/programas verificado');
 }
@@ -108,8 +112,8 @@ async function migrate() {
     idByName.set(nombre, out[0].id);
   }
 
-  // 2) programas por lotes (upsert por ficha) — 13 columnas por fila
-  const COLS = 13;
+  // 2) programas por lotes (upsert por ficha) — 14 columnas por fila
+  const COLS = 14;
   const BATCH = 400;
   const rowToParams = (r) => {
     const inst = (r.institucion || '').trim();
@@ -127,6 +131,7 @@ async function migrate() {
       (r.arancel || '').trim() || null,       // arancel_texto
       arancelToInt(r.arancel),                // arancel_valor
       norm(`${r.carrera || ''} ${r.institucion || ''}`), // search_text
+      norm(r.carrera),                        // carrera_norm
     ];
   };
   for (let b = 0; b < rows.length; b += BATCH) {
@@ -138,14 +143,15 @@ async function migrate() {
     const params = chunk.flatMap(rowToParams);
     await pool.query(
       `INSERT INTO programas
-         (ficha, institucion_id, institucion, tipo, area, carrera, sede, region, jornada, duracion, arancel_texto, arancel_valor, search_text)
+         (ficha, institucion_id, institucion, tipo, area, carrera, sede, region, jornada, duracion, arancel_texto, arancel_valor, search_text, carrera_norm)
        VALUES ${placeholders}
        ON CONFLICT (ficha) DO UPDATE SET
          institucion_id = EXCLUDED.institucion_id, institucion = EXCLUDED.institucion,
          tipo = EXCLUDED.tipo, area = EXCLUDED.area, carrera = EXCLUDED.carrera,
          sede = EXCLUDED.sede, region = EXCLUDED.region, jornada = EXCLUDED.jornada,
          duracion = EXCLUDED.duracion, arancel_texto = EXCLUDED.arancel_texto,
-         arancel_valor = EXCLUDED.arancel_valor, search_text = EXCLUDED.search_text`,
+         arancel_valor = EXCLUDED.arancel_valor, search_text = EXCLUDED.search_text,
+         carrera_norm = EXCLUDED.carrera_norm`,
       params
     );
   }
@@ -175,11 +181,16 @@ async function getStats() {
   return rows[0];
 }
 
-async function search({ q, tipo, region, area, limit } = {}) {
+async function search({ q, career, tipo, region, area, limit } = {}) {
   const params = [];
   const where = [];
-  const qn = norm(q);
-  if (qn) { params.push('%' + qn + '%'); where.push(`search_text ILIKE $${params.length}`); }
+  const careerN = norm(career);
+  if (careerN) {                 // coincidencia exacta de carrera (al elegir una sugerencia)
+    params.push(careerN); where.push(`carrera_norm = $${params.length}`);
+  } else {
+    const qn = norm(q);
+    if (qn) { params.push('%' + qn + '%'); where.push(`search_text ILIKE $${params.length}`); }
+  }
   if (tipo) { params.push(tipo); where.push(`tipo = $${params.length}`); }
   if (region) { params.push(region); where.push(`region = $${params.length}`); }
   if (area) { params.push(area); where.push(`area = $${params.length}`); }
@@ -196,4 +207,33 @@ async function search({ q, tipo, region, area, limit } = {}) {
   return rows;
 }
 
-module.exports = { initSchema, migrate, ensureLoaded, getStats, search, DATASET_URL };
+// Sugerencias de carreras (autocompletado) — agregadas por carrera normalizada.
+async function suggest({ q, tipo, region } = {}) {
+  const qn = norm(q);
+  if (qn.length < 2) return [];
+  const params = ['%' + qn + '%'];
+  const where = [`carrera_norm ILIKE $1`];
+  if (tipo) { params.push(tipo); where.push(`tipo = $${params.length}`); }
+  if (region) { params.push(region); where.push(`region = $${params.length}`); }
+  params.push(qn); const pExact = '$' + params.length;
+  params.push(qn + '%'); const pPrefix = '$' + params.length;
+  const sql = `
+    SELECT carrera_norm AS key, min(carrera) AS career,
+           count(*)::int AS count,
+           count(DISTINCT institucion)::int AS institution_count,
+           array_agg(DISTINCT tipo) AS types
+    FROM programas
+    WHERE ${where.join(' AND ')}
+    GROUP BY carrera_norm
+    ORDER BY CASE WHEN carrera_norm = ${pExact} THEN 0
+                  WHEN carrera_norm LIKE ${pPrefix} THEN 1 ELSE 2 END,
+             min(carrera)
+    LIMIT 8`;
+  const { rows } = await pool.query(sql, params);
+  return rows.map((r) => ({
+    key: r.key, career: r.career, count: r.count, institutionCount: r.institution_count,
+    typeList: ['Universidad', 'IP', 'CFT'].filter((t) => (r.types || []).includes(t)),
+  }));
+}
+
+module.exports = { initSchema, migrate, ensureLoaded, getStats, search, suggest, DATASET_URL };
