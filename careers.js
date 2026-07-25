@@ -60,6 +60,14 @@ async function initSchema() {
   `);
   // Migración suave: columnas que pueden faltar si la tabla ya existía.
   try { await pool.query(`ALTER TABLE programas ADD COLUMN IF NOT EXISTS carrera_norm TEXT;`); } catch (e) { /* noop */ }
+  // Clasificación de instituciones: dependencia (estatal | g9 | privada) y gratuidad.
+  for (const col of [
+    'ADD COLUMN IF NOT EXISTS dependencia TEXT',
+    'ADD COLUMN IF NOT EXISTS gratuidad BOOLEAN',
+  ]) {
+    try { await pool.query(`ALTER TABLE instituciones ${col};`); } catch (e) { /* noop */ }
+  }
+  try { await pool.query(`CREATE INDEX IF NOT EXISTS instituciones_dependencia_idx ON instituciones (dependencia);`); } catch (e) { /* noop */ }
   await pool.query(`CREATE INDEX IF NOT EXISTS programas_institucion_idx ON programas (institucion_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS programas_region_idx ON programas (region);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS programas_tipo_idx ON programas (tipo);`);
@@ -192,30 +200,60 @@ async function getStats() {
   return rows[0];
 }
 
-async function search({ q, career, tipo, region, area, limit } = {}) {
+async function search({ q, career, tipo, region, area, dependencia, gratuidad, limit } = {}) {
   const params = [];
   const where = [];
   const careerN = norm(career);
   if (careerN) {                 // coincidencia exacta de carrera (al elegir una sugerencia)
-    params.push(careerN); where.push(`carrera_norm = $${params.length}`);
+    params.push(careerN); where.push(`p.carrera_norm = $${params.length}`);
   } else {
     const qn = norm(q);
-    if (qn) { params.push('%' + qn + '%'); where.push(`search_text ILIKE $${params.length}`); }
+    if (qn) { params.push('%' + qn + '%'); where.push(`p.search_text ILIKE $${params.length}`); }
   }
-  if (tipo) { params.push(tipo); where.push(`tipo = $${params.length}`); }
-  if (region) { params.push(region); where.push(`region = $${params.length}`); }
-  if (area) { params.push(area); where.push(`area = $${params.length}`); }
+  if (tipo) { params.push(tipo); where.push(`p.tipo = $${params.length}`); }
+  if (region) { params.push(region); where.push(`p.region = $${params.length}`); }
+  if (area) { params.push(area); where.push(`p.area = $${params.length}`); }
+  // Filtros por clasificación de la institución. `dependencia` acepta varias
+  // separadas por coma (estatal,g9,privada); `gratuidad=1` restringe a adscritas.
+  const deps = String(dependencia || '').split(',').map((d) => d.trim().toLowerCase())
+    .filter((d) => ['estatal', 'g9', 'privada'].includes(d));
+  if (deps.length) { params.push(deps); where.push(`i.dependencia = ANY($${params.length})`); }
+  if (gratuidad === true || gratuidad === '1' || gratuidad === 'true') {
+    where.push(`i.gratuidad IS TRUE`);
+  }
   const lim = Math.min(Number(limit) || 800, 2000);
   params.push(lim);
   const sql = `
-    SELECT area, carrera, institucion, tipo, sede, region, jornada,
-           arancel_texto AS arancel, duracion, ficha
-    FROM programas
+    SELECT p.area, p.carrera, p.institucion, p.tipo, p.sede, p.region, p.jornada,
+           p.arancel_texto AS arancel, p.duracion, p.ficha,
+           i.dependencia, i.gratuidad
+    FROM programas p
+    LEFT JOIN instituciones i ON i.id = p.institucion_id
     ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-    ORDER BY institucion, carrera
+    ORDER BY p.institucion, p.carrera
     LIMIT $${params.length}`;
   const { rows } = await pool.query(sql, params);
   return rows;
+}
+
+// Carga/actualiza la clasificación de instituciones (dependencia + gratuidad).
+async function setClasificacion(items) {
+  if (!Array.isArray(items) || !items.length) throw new Error('items requerido');
+  let updated = 0, missing = [];
+  for (const it of items) {
+    const nombre = (it.nombre || '').trim();
+    if (!nombre) continue;
+    const dep = ['estatal', 'g9', 'privada'].includes(String(it.dependencia || '').toLowerCase())
+      ? String(it.dependencia).toLowerCase() : null;
+    const { rowCount } = await pool.query(
+      `UPDATE instituciones SET dependencia = $2, gratuidad = $3 WHERE nombre = $1`,
+      [nombre, dep, it.gratuidad === true]);
+    if (rowCount) updated += rowCount; else missing.push(nombre);
+  }
+  const { rows } = await pool.query(
+    `SELECT dependencia, count(*)::int AS n, count(*) FILTER (WHERE gratuidad)::int AS con_gratuidad
+     FROM instituciones WHERE tipo = 'Universidad' GROUP BY dependencia ORDER BY dependencia`);
+  return { updated, missing, resumen: rows };
 }
 
 // Sugerencias de carreras (autocompletado) — agregadas por carrera normalizada.
@@ -332,4 +370,4 @@ async function upsertInfo({ career, descripcion, duracion_promedio, area_desempe
   return rows[0];
 }
 
-module.exports = { initSchema, migrate, ensureLoaded, getStats, search, suggest, getInfo, upsertInfo, DATASET_URL };
+module.exports = { initSchema, migrate, ensureLoaded, getStats, search, suggest, getInfo, upsertInfo, setClasificacion, DATASET_URL };
