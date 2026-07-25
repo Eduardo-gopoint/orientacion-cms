@@ -247,14 +247,73 @@ async function suggest({ q, tipo, region } = {}) {
   }));
 }
 
-// Contenido editorial dinámico por carrera (bloque "Beneficios de estudiar…").
+// ---------- Contenido editorial dinámico por carrera ----------
+// Palabras que no distinguen una carrera de otra (conectores y genéricos): se ignoran
+// al comparar, para que "pedagogía básica" calce con "Pedagogía en Educación Básica".
+const GENERIC_TOKENS = new Set(['en', 'de', 'del', 'la', 'el', 'los', 'las', 'y', 'e', 'a',
+  'con', 'para', 'carrera', 'licenciatura', 'bachillerato', 'mencion', 'menciones',
+  'plan', 'especial', 'educacion']);
+
+// Abreviaturas frecuentes al escribir el nombre de una carrera.
+const ABBREV = { ing: 'ingenieria', ingr: 'ingenieria', ped: 'pedagogia', tec: 'tecnico', tns: 'tecnico' };
+
+function keyTokens(s) {
+  return norm(s).split(/[^a-z0-9ñ]+/)
+    .map((t) => ABBREV[t] || t)
+    .filter((t) => t && !GENERIC_TOKENS.has(t));
+}
+
+// Cache en memoria: la tabla es pequeña y se consulta en cada búsqueda.
+let infoCache = { rows: null, at: 0 };
+const INFO_TTL_MS = 60 * 1000;
+
+async function loadInfoRows() {
+  const now = Date.now();
+  if (infoCache.rows && (now - infoCache.at) < INFO_TTL_MS) return infoCache.rows;
+  const { rows } = await pool.query(
+    `SELECT carrera_norm, carrera, descripcion, duracion_promedio, area_desempeno FROM carreras_info`);
+  infoCache = { rows, at: now };
+  return rows;
+}
+
+const publicInfo = (r) => ({
+  carrera: r.carrera, descripcion: r.descripcion,
+  duracion_promedio: r.duracion_promedio, area_desempeno: r.area_desempeno,
+});
+
 async function getInfo(career) {
   const cn = norm(career);
   if (!cn) return null;
-  const { rows } = await pool.query(
-    `SELECT carrera, descripcion, duracion_promedio, area_desempeno
-     FROM carreras_info WHERE carrera_norm = $1`, [cn]);
-  return rows[0] || null;
+  const rows = await loadInfoRows();
+  if (!rows.length) return null;
+
+  // 1) Coincidencia exacta: siempre gana.
+  const exact = rows.find((r) => r.carrera_norm === cn);
+  if (exact) return publicInfo(exact);
+
+  // 2) Coincidencia flexible por palabras clave.
+  const qt = keyTokens(career);
+  if (!qt.length) return null;
+  const qset = new Set(qt);
+  let best = null, bestScore = 0;
+  for (const r of rows) {
+    const kset = new Set(keyTokens(r.carrera || r.carrera_norm));
+    if (!kset.size) continue;
+    const inter = [...kset].filter((t) => qset.has(t)).length;
+    if (!inter) continue;
+    const union = new Set([...kset, ...qset]).size;
+    const jaccard = inter / union;
+    const keyCovered = inter === kset.size;   // "Nutrición" ⊂ "nutrición y dietética"
+    const queryCovered = inter === qset.size; // "veterinaria" ⊂ "Medicina Veterinaria"
+    let score = 0;
+    if (keyCovered) score = 0.9 + jaccard * 0.1;
+    else if (queryCovered) score = 0.7 + jaccard * 0.1;
+    else if (jaccard >= 0.6) score = jaccard;
+    else continue;
+    score -= Math.abs(kset.size - qset.size) * 0.001; // desempate: nombre más cercano
+    if (score > bestScore) { bestScore = score; best = r; }
+  }
+  return best ? publicInfo(best) : null;
 }
 
 async function upsertInfo({ career, descripcion, duracion_promedio, area_desempeno } = {}) {
@@ -269,6 +328,7 @@ async function upsertInfo({ career, descripcion, duracion_promedio, area_desempe
        updated_at = now()
      RETURNING carrera_norm`,
     [cn, career, descripcion || null, duracion_promedio || null, area_desempeno || null]);
+  infoCache = { rows: null, at: 0 }; // el contenido nuevo debe verse de inmediato
   return rows[0];
 }
 
