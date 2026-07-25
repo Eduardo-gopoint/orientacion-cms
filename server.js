@@ -8,6 +8,7 @@ const cookieParser = require('cookie-parser');
 const db = require('./db');
 const auth = require('./auth');
 const { sendLeadEmail } = require('./mailer');
+const mailer = require('./mailer');
 const calendar = require('./calendar');
 const whapi = require('./whapi');
 const careers = require('./careers');
@@ -66,7 +67,9 @@ app.post('/api/contact', async (req, res) => {
     try { saved = await db.insertLead({ ...lead, emailed: false }); }
     catch (e) { console.error('[contact] DB:', e.message); }
 
-    const mail = await sendLeadEmail(lead);
+    // Modo prueba: guarda el lead pero NO envía correo (para probar sin notificar).
+    const isTest = b.test === 1 || b.test === '1' || b.test === true;
+    const mail = isTest ? { ok: true, skipped: 'modo prueba' } : await sendLeadEmail(lead);
     if (mail.ok && saved) db.markEmailed(saved.id).catch(() => {});
     if (!mail.ok) console.error('[contact] mail:', mail.error);
 
@@ -157,6 +160,37 @@ app.get('/api/carreras/info', async (req, res) => {
   publicRead(res);
   try { res.json({ ok: true, info: await careers.getInfo(req.query.career) }); }
   catch (err) { console.error('[carreras/info]', err.message); res.status(500).json({ ok: false, error: 'Error interno.' }); }
+});
+
+// ---------- Diagnóstico (token) ----------
+const migrateGuard = (req, res) => {
+  const token = req.get('x-migrate-token') || (req.query && req.query.token) || '';
+  const expected = process.env.MIGRATE_TOKEN || '';
+  if (!expected || token !== expected) { res.status(401).json({ ok: false, error: 'Token inválido.' }); return false; }
+  return true;
+};
+
+// Estado del correo y de los últimos leads: permite ver si el envío está saliendo.
+app.get('/api/admin/diag', async (req, res) => {
+  if (!migrateGuard(req, res)) return;
+  try {
+    const stats = await db.leadsStats();
+    const rows = await db.listLeads({ limit: 8 });
+    res.json({
+      ok: true, stats,
+      mail: { from: mailer.MAIL_FROM, to: mailer.MAIL_TO, resend_key_set: !!process.env.RESEND_API_KEY },
+      ultimos: rows.map((l) => ({ id: l.id, created_at: l.created_at, name: l.name, email: l.email,
+        source: l.source, source_page: l.source_page, emailed: l.emailed })),
+    });
+  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
+});
+
+// Envío de prueba a un destinatario elegido (para no notificar a la clienta al probar).
+app.post('/api/admin/test-mail', async (req, res) => {
+  if (!migrateGuard(req, res)) return;
+  const to = ((req.query && req.query.to) || (req.body && req.body.to) || '').toString().trim();
+  const from = ((req.query && req.query.from) || (req.body && req.body.from) || '').toString().trim();
+  res.json(await mailer.sendTest({ to, from: from || undefined }));
 });
 
 // Carga de la clasificación de instituciones (estatal/G9/privada + gratuidad).
