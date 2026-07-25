@@ -126,6 +126,7 @@ app.get('/api/carreras', async (req, res) => {
     const rows = await careers.search({
       q: req.query.q, career: req.query.career, tipo: req.query.tipo,
       region: req.query.region, area: req.query.area, limit: req.query.limit,
+      dependencia: req.query.dependencia, gratuidad: req.query.gratuidad,
     });
     res.json({ ok: true, count: rows.length, rows });
   } catch (err) {
@@ -156,6 +157,15 @@ app.get('/api/carreras/info', async (req, res) => {
   publicRead(res);
   try { res.json({ ok: true, info: await careers.getInfo(req.query.career) }); }
   catch (err) { console.error('[carreras/info]', err.message); res.status(500).json({ ok: false, error: 'Error interno.' }); }
+});
+
+// Carga de la clasificación de instituciones (estatal/G9/privada + gratuidad).
+app.post('/api/admin/instituciones-clasificacion', async (req, res) => {
+  const token = req.get('x-migrate-token') || (req.query && req.query.token) || '';
+  const expected = process.env.MIGRATE_TOKEN || '';
+  if (!expected || token !== expected) return res.status(401).json({ ok: false, error: 'Token inválido.' });
+  try { res.json({ ok: true, ...(await careers.setClasificacion((req.body || {}).items)) }); }
+  catch (err) { console.error('[clasificacion]', err.message); res.status(500).json({ ok: false, error: err.message }); }
 });
 
 // Escritura del contenido editorial (protegida por token, para redactar/actualizar).
