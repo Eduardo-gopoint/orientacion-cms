@@ -46,7 +46,7 @@ async function sendLeadEmail(lead) {
     });
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) {
-      return { ok: false, error: data && data.message ? data.message : `HTTP ${resp.status}` };
+      return { ok: false, status: resp.status, error: data && data.message ? data.message : `HTTP ${resp.status}`, raw: data };
     }
     return { ok: true, id: data.id };
   } catch (err) {
@@ -54,4 +54,28 @@ async function sendLeadEmail(lead) {
   }
 }
 
-module.exports = { sendLeadEmail, MAIL_FROM, MAIL_TO };
+
+// Envío de prueba a un destinatario específico. Devuelve el error crudo de Resend
+// para poder diagnosticar (dominio no verificado, key inválida, from no permitido, etc.).
+async function sendTest({ to, from } = {}) {
+  if (!RESEND_API_KEY) return { ok: false, error: 'RESEND_API_KEY no configurada' };
+  const dest = (to || MAIL_TO);
+  try {
+    const resp = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: from || MAIL_FROM,
+        to: [dest],
+        subject: 'Prueba tecnica de envio (ignorar)',
+        html: '<p>Prueba tecnica del sistema de formularios. Puedes ignorar este mensaje.</p>',
+      }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    return { ok: resp.ok, status: resp.status, to: dest, from: from || MAIL_FROM, id: data && data.id, raw: data };
+  } catch (err) {
+    return { ok: false, error: err.message, to: dest };
+  }
+}
+
+module.exports = { sendLeadEmail, sendTest, MAIL_FROM, MAIL_TO };
